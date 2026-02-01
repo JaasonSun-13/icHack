@@ -1,0 +1,104 @@
+# configs/default.yaml
+# Social Volatility Forecaster
+
+data:
+  master_csv: "data/master.csv"
+  events_csv: "data/events.csv"
+
+features:
+  # Your raw columns in master.csv
+  vix_cols:
+    - "vix"
+    - "vix_average_prev3d"
+    - "vix_average_prev7d"
+    - "vix_slope_20d"
+
+  # Rolling windows applied to vix + event_intensity
+  rolling_windows:
+    - 5
+    - 20
+    - 60
+
+  # Event history windows (days back to count events)
+  event_windows:
+    - 30
+    - 90
+
+  # Event types (3 merged classes)
+  event_types:
+    - "geopolitics"
+    - "macro"
+    - "crisis"
+
+labels:
+  horizons:
+    - 7
+    - 14
+    - 30
+  # Social vol = weighted combo of attention + market stress
+  social_vol_weights:
+    attention: 0.70
+    market: 0.30
+
+model:
+  lgbm_params:
+    binary:
+      objective: "binary"
+      metric: "auc"
+      num_leaves: 31
+      learning_rate: 0.05
+      feature_fraction: 0.8
+      bagging_fraction: 0.8
+      bagging_freq: 5
+      verbose: -1
+      n_estimators: 500
+      early_stopping_rounds: 50
+      is_unbalance: true
+    multiclass:
+      objective: "multiclass"
+      metric: "multi_logloss"
+      num_leaves: 31
+      learning_rate: 0.05
+      feature_fraction: 0.8
+      bagging_fraction: 0.8
+      bagging_freq: 5
+      verbose: -1
+      n_estimators: 500
+      early_stopping_rounds: 50
+    regression:
+      objective: "regression"
+      metric: "rmse"
+      num_leaves: 31
+      learning_rate: 0.05
+      feature_fraction: 0.8
+      bagging_fraction: 0.8
+      bagging_freq: 5
+      verbose: -1
+      n_estimators: 500
+      early_stopping_rounds: 50
+
+validation:
+  val_years:
+    - 2022
+    - 2023
+    - 2024
+    - 2025
+  test_year: 2026
+  calibration_method: "isotonic"
+
+policy:
+  risk_high_threshold: 0.7
+  risk_medium_threshold: 0.4
+  social_vol_high_threshold: 0.7
+  social_vol_medium_threshold: 0.4
+  high_priority_types:
+    - "geopolitics"
+    - "macro"
+
+output:
+  artifacts_dir: "artifacts"
+  outputs_dir: "outputs"
+  reports_dir: "reports"
+
+logging:
+  level: "INFO"
