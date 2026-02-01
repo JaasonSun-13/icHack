@@ -1,0 +1,15 @@
+1. The classified news can be use as a dictionary, you can see which news
+is in the major event frame. Then link it back to the classification
+
+2. The final volatitliy csv should be straightforward
+
+3. Each year to trend names are in TrendCSV, divided by year
+
+4. Pytrend is the trend indicator we first used but give up using now
+
+5. In the major event frame, there might be less than 50 events in some years.
+Because the 'near' function does not work / gives abnormal data so I just
+remove those events.
+
+6. THE PROJECT TIME LINE IS NOW FROM 2017-01-01 to 2025-12-31 AS GBLTDOC
+DOES NOT HAVE DATA BEFORE 2017

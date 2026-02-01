@@ -1,0 +1,130 @@
+import unittest.mock
+import pandas as pd
+import unittest
+from datetime import datetime, timedelta
+
+from gdeltdoc import GdeltDoc, Filters
+from gdeltdoc.errors import RateLimitError
+from tests.test_errors import build_response
+
+
+class ArticleSearchTestCast(unittest.TestCase):
+    """
+    Test that the API client behaves correctly when doing an article search query
+    """
+
+    def setUp(self):
+        self.start_date = (datetime.today() - timedelta(days=7)).strftime("%Y-%m-%d")
+        self.end_date = (datetime.today() - timedelta(days=6)).strftime("%Y-%m-%d")
+
+        f = Filters(
+            keyword="environment", start_date=self.start_date, end_date=self.end_date
+        )
+        self.articles = GdeltDoc().article_search(f)
+
+    def tearDown(self):
+        pass
+
+    def test_articles_is_a_df(self):
+        self.assertEqual(type(self.articles), pd.DataFrame)
+
+    def test_correct_columns(self):
+        self.assertEqual(
+            list(self.articles.columns),
+            [
+                "url",
+                "url_mobile",
+                "title",
+                "seendate",
+                "socialimage",
+                "domain",
+                "language",
+                "sourcecountry",
+            ],
+        )
+
+    def test_rows_returned(self):
+        # This test could fail if there really are no articles
+        # that match the filter, but given the query used for
+        # This tests could fail if there really are no articles
+        # that match the filter, but given the query used for
+        # testing that's very unlikely.
+        self.assertGreaterEqual(self.articles.shape[0], 1)
+
+
+class TimelineSearchTestCase(unittest.TestCase):
+    """
+    Test that the various modes of timeline search behave correctly.
+    """
+
+    # Make one set of API calls per tests suite run, not one per test
+    @classmethod
+    def setUpClass(cls):
+        cls.start_date = (datetime.today() - timedelta(days=7)).strftime("%Y-%m-%d")
+        cls.end_date = (datetime.today() - timedelta(days=6)).strftime("%Y-%m-%d")
+
+        f = Filters(
+            keyword="environment", start_date=cls.start_date, end_date=cls.end_date
+        )
+
+        gd = GdeltDoc()
+        cls.all_results = [
+            gd.timeline_search(mode, f)
+            for mode in [
+                "timelinevol",
+                "timelinevolraw",
+                "timelinelang",
+                "timelinetone",
+                "timelinesourcecountry",
+            ]
+        ]
+
+    def test_all_modes_return_a_df(self):
+        self.assertTrue(
+            all([type(result) == pd.DataFrame for result in self.all_results])
+        )
+
+    def test_all_modes_return_data(self):
+        self.assertTrue(all([result.shape[0] >= 1 for result in self.all_results]))
+
+    def test_unsupported_mode(self):
+        with self.assertRaisesRegex(ValueError, "not in supported API modes"):
+            GdeltDoc().timeline_search(
+                "unsupported",
+                Filters(
+                    keyword="environment",
+                    start_date=self.start_date,
+                    end_date=self.end_date,
+                ),
+            )
+
+    def test_vol_has_two_columns(self):
+        self.assertEqual(self.all_results[0].shape[1], 2)
+
+    def test_vol_raw_has_three_columns(self):
+        self.assertEqual(self.all_results[1].shape[1], 3)
+
+    def test_handles_empty_API_response(self):
+        gd = GdeltDoc()
+        with unittest.mock.patch.object(gd, "_query") as query_mock:
+            query_mock.return_value = {}
+            result = gd.timeline_search(
+                "timelinetone", Filters(keyword="environment", timespan="1h")
+            )
+            self.assertTrue(type(result) == pd.DataFrame)
+            self.assertEqual(result.shape[0], 0)
+
+
+class QueryTestCase(unittest.TestCase):
+
+    def test_handles_invalid_query_string(self):
+        with self.assertRaisesRegex(
+            ValueError, "The query was not valid. The API error message was"
+        ):
+            GdeltDoc()._query("artlist", "environment&timespan=mins15")
+
+    def test_raises_an_error_when_response_is_bad_status_code(self):
+        with self.assertRaises(RateLimitError):
+            with unittest.mock.patch("requests.get") as requests_mock:
+                requests_mock.return_value = build_response(429)
+                GdeltDoc()._query("artlist", "")

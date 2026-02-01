@@ -2,24 +2,29 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 
-# Volatility index tickers
-tickers = ["^VIX", "^VIX9D", "^VVIX", "^MOVE", "^VXN", "^RVX"]
-
-start_date = "2015-01-01"
+tickers = ["^GSPC", "^VIX"]
+start_date = "2017-01-01"
 end_date = "2025-12-31"
 
-# Download data
-data = yf.download(tickers, start=start_date, end=end_date)
 
-# Extract Close prices only
-close_prices = data["Close"]
+# # Download intraday data (last ~60 days max for 5m)
+# data = yf.download(tickers, start=start_date, end=end_date)
+# data.to_csv('spxnol_prices.csv')
 
-# Rename columns for clarity
-close_prices.columns = ["VIX", "VIX9D", "VVIX", "MOVE", "VXN", "RVX"]
 
-# Save to CSV
-close_prices.to_csv("volatility_indices_2015_2025.csv")
+vol_30 = pd.read_csv('FinanceDataPuller/1-day-vol.csv')
+df = pd.read_csv("FinanceDataPuller/spxnvol_prices.csv")
+df.index = df['Date']
+vol_30['date'] = pd.to_datetime(vol_30['date'])
+vol_30 = vol_30.set_index("date")
 
-# Preview
-print(close_prices.head())
-print(close_prices.tail())
+prices_spx = pd.DataFrame()
+prices_spx['spx_close'] = df['Close^GSPC']
+prices_spx['1_day_vol'] = prices_spx['spx_close'].pct_change().abs()
+
+prices_spx['3_day_avg_vol'] = prices_spx['1_day_vol'].rolling(3).mean()
+print(vol_30['vol'])
+print(prices_spx['3_day_avg_vol'])
+prices_spx['30_day_implied_vol'] = vol_30['vol'].reindex(prices_spx.index)
+
+prices_spx.to_csv('FinanceDataPuller/finalvol.csv')
