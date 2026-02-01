@@ -1,130 +1,155 @@
 #!/usr/bin/env python3
-"""Streamlit dashboard: streamlit run app.py"""
+"""SVF v3 Streamlit Dashboard — Unified Model."""
+import glob, os, sys
+import numpy as np, pandas as pd
 
-import json, os, sys
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+try:
+    import streamlit as st
+except ImportError:
+    print("pip install streamlit"); sys.exit(1)
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import streamlit as st
-from src.policy import PolicyTree
+from src.utils import load_config, load_pickle
+from src.data import load_master, load_events, compute_severity
+from src.features import build_all_features, get_feature_columns
+from src.models import blend_predictions
+from src.policy import apply_policy, format_alert
 
-st.set_page_config(page_title="Social Volatility Forecaster", page_icon="📊", layout="wide")
+st.set_page_config(page_title="SVF v3", layout="wide")
+st.title("🌐 Social Volatility Forecaster v3")
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+cfg = load_config()
+art = cfg["output"]["artifacts_dir"]
 
-def gauge(value, title, max_val=1.0, suffix=""):
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number", value=value,
-        title={"text": title}, number={"suffix": suffix},
-        gauge={"axis": {"range": [0, max_val]},
-               "bar": {"color": "darkblue"},
-               "steps": [
-                   {"range": [0, max_val * 0.4], "color": "#90EE90"},
-                   {"range": [max_val * 0.4, max_val * 0.7], "color": "#FFD700"},
-                   {"range": [max_val * 0.7, max_val], "color": "#FF6B6B"}]}))
-    fig.update_layout(height=250, margin=dict(l=20, r=20, t=50, b=20))
-    return fig
+@st.cache_data
+def load_base():
+    m = load_master(cfg["data"]["master_csv"])
+    e = load_events(cfg["data"]["events_csv"])
+    e = compute_severity(m, e)
+    return m, e
 
-ALERT_COLOURS = {"HIGH": "#FF4B4B", "MEDIUM": "#FFA500", "LOW": "#00CC00"}
+master, events = load_base()
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# Sidebar: new data point
+st.sidebar.header("📊 New Data")
+new_spx = st.sidebar.number_input("SPX", value=float(master["spx_close"].iloc[-1]), step=10.0)
+new_iv = st.sidebar.number_input("IV", value=float(master["30_day_implied_vol"].iloc[-1]), step=0.5)
+new_rv = st.sidebar.number_input("RV 1d", value=float(master["1_day_vol"].iloc[-1]), step=0.001, format="%.4f")
+new_int = st.sidebar.number_input("Intensity", value=0.0, step=0.5)
+new_spike = st.sidebar.number_input("Trend Spike", value=0.0, step=1.0)
+add_new = st.sidebar.button("🔮 Predict")
 
-def main():
-    st.title("📊 Social Volatility Forecaster")
+if add_new:
+    nd = master["date"].max() + pd.tseries.offsets.BDay(1)
+    master = pd.concat([master, pd.DataFrame([{
+        "date": nd, "spx_close": new_spx, "1_day_vol": new_rv,
+        "3_day_avg_vol": new_rv, "30_day_implied_vol": new_iv,
+        "event_intensity": new_int, "trend_spike": new_spike,
+    }])], ignore_index=True)
 
-    # Sidebar
-    model_dir = st.sidebar.text_input("Model directory", "artifacts/latest")
-    pred_path = st.sidebar.text_input("Predictions file", "outputs/predictions.csv")
-    horizon = st.sidebar.selectbox("Horizon", [7, 14, 30], format_func=lambda x: f"{x} days")
+feat = build_all_features(master, events, cfg=cfg)
+fc = load_pickle(f"{art}/feature_cols.pkl")
+horizons = load_pickle(f"{art}/horizons.pkl")
+base_cols = [c for c in fc if c != "horizon"]
 
-    # Load predictions
-    if not os.path.exists(pred_path):
-        st.warning("No predictions found. Run `python train.py` first.")
-        return
+matches = sorted(glob.glob(f"{art}/fold*_single.pkl"))
+if not matches:
+    st.error("No models found."); st.stop()
+folds = sorted(set(int(os.path.basename(m).split("fold")[1].split("_")[0]) for m in matches))
+fold = st.sidebar.selectbox("Model", folds, index=len(folds)-1,
+    format_func=lambda x: f"Fold {x} (Prod)" if x == folds[-1] else f"Fold {x}")
 
-    df = pd.read_csv(pred_path)
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"])
+prefix = f"{art}/fold{fold}"
+single = load_pickle(f"{prefix}_single.pkl")
+ens = load_pickle(f"{prefix}_ensemble.pkl")
+cal = load_pickle(f"{prefix}_calibrator.pkl")
+tm = load_pickle(f"{prefix}_type.pkl")
+sm = load_pickle(f"{prefix}_svol.pkl")
 
-    # Load type mapping
-    idx_to_type = {}
-    tm_path = os.path.join(model_dir, "event_type_mapping.json")
-    if os.path.exists(tm_path):
-        with open(tm_path) as f:
-            m = json.load(f)
-            idx_to_type = {int(k): v for k, v in m.get("idx_to_type", {}).items()}
+bcfg = cfg.get("model", {}).get("blend_weights", {})
+pcfg = cfg["policy"]
+type_map = {0: "crisis", 1: "geopolitics", 2: "macro"}
 
-    # Latest row
-    latest = df.iloc[-1]
-    risk_prob = latest.get(f"risk_{horizon}d_prob", 0)
-    social_vol = latest.get(f"social_vol_{horizon}d", 0)
-    etype_idx = latest.get(f"event_type_{horizon}d", -1)
-    etype_name = idx_to_type.get(int(etype_idx), "unknown") if not pd.isna(etype_idx) else "unknown"
+# Run predictions for all dates × all horizons
+results = []
+X_base = feat[base_cols].values
 
-    # Policy
-    pt = PolicyTree()
-    dec = pt.evaluate(risk_prob, social_vol, etype_name)
-    colour = ALERT_COLOURS.get(dec.alert_level, "#808080")
+for h in horizons:
+    X_h = np.hstack([X_base, np.full((len(X_base), 1), h)])
+    risk_raw = blend_predictions(ens.predict(X_h), single.predict(X_h),
+                                  bcfg.get("ensemble", 0.6), bcfg.get("single", 0.4))
+    risk_cal = cal.transform(risk_raw)
+    sv = sm.predict(X_h) if sm.model else np.full(len(X_h), 0.5)
+    if tm.model:
+        tp = tm.predict(X_h)
+        et = [type_map[np.argmax(tp[i])] for i in range(len(tp))] if tp.ndim > 1 else [type_map[int(t)] for t in tp]
+    else:
+        et = ["crisis"] * len(X_h)
+    for i in range(len(X_base)):
+        results.append({"date": feat["date"].iloc[i], "horizon": h,
+                        "risk": risk_cal[i], "svol": sv[i], "type": et[i]})
 
-    # Header
-    st.markdown(f"### Forecast date: {latest.get('date', 'N/A')}")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.markdown(f'<div style="background:{colour};padding:12px;border-radius:6px;'
-                f'text-align:center;color:#fff;font-weight:bold;font-size:20px">'
-                f'{dec.alert_level}</div>', unsafe_allow_html=True)
-    c2.metric(f"Risk ({horizon}d)", f"{risk_prob:.1%}")
-    c3.metric(f"Social Vol ({horizon}d)", f"{social_vol:.2f}")
-    c4.metric("Event Type", etype_name)
+rdf = pd.DataFrame(results)
 
-    st.divider()
+# Enforce monotonicity per date
+for d in rdf["date"].unique():
+    mask = rdf["date"] == d
+    vals = rdf.loc[mask].sort_values("horizon")["risk"].values
+    for j in range(1, len(vals)):
+        if vals[j] < vals[j-1]:
+            vals[j] = vals[j-1]
+    rdf.loc[mask, "risk"] = np.sort(rdf.loc[mask, "risk"].values)
 
-    # Gauges
-    g1, g2 = st.columns(2)
-    g1.plotly_chart(gauge(risk_prob * 100, "Risk Probability", 100, "%"), use_container_width=True)
-    g2.plotly_chart(gauge(social_vol, "Social Volatility"), use_container_width=True)
+# Latest date display
+latest_date = rdf["date"].max()
+latest = rdf[rdf["date"] == latest_date].sort_values("horizon")
 
-    # Time series
-    st.subheader("📈 Historical Trends")
-    rp_col = f"risk_{horizon}d_prob"
-    sv_col = f"social_vol_{horizon}d"
-    if rp_col in df.columns and sv_col in df.columns and "date" in df.columns:
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                            subplot_titles=("Risk Probability", "Social Volatility"))
-        fig.add_trace(go.Scatter(x=df["date"], y=df[rp_col], name="Risk"), row=1, col=1)
-        fig.add_hline(y=0.7, line_dash="dash", line_color="red", row=1, col=1)
-        fig.add_trace(go.Scatter(x=df["date"], y=df[sv_col], name="SocVol",
-                                 line=dict(color="green")), row=2, col=1)
-        fig.add_hline(y=0.7, line_dash="dash", line_color="red", row=2, col=1)
-        fig.update_layout(height=450, showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
+if add_new:
+    st.success(f"🆕 New prediction: {latest_date.strftime('%Y-%m-%d')}")
 
-    # Recommendations
-    st.subheader("💡 Recommendations")
-    tabs = st.tabs(["🏦 Investor", "🏢 Firm", "🚀 Entrepreneur"])
-    for tab, persona in zip(tabs, ["investor", "firm", "entrepreneur"]):
-        with tab:
-            st.write(dec.recommendations.get(persona, "No recommendation"))
+st.divider()
+st.subheader(f"📅 {latest_date.strftime('%Y-%m-%d')}")
 
-    # Feature importance
-    imp_path = os.path.join(model_dir, "feature_importance.json")
-    if os.path.exists(imp_path):
-        with open(imp_path) as f:
-            imp = json.load(f)
-        st.subheader("🔍 Top Feature Drivers")
-        fig = go.Figure(go.Bar(
-            x=list(imp.values()), y=list(imp.keys()),
-            orientation="h", marker_color="#1f77b4"))
-        fig.update_layout(height=400, yaxis={"categoryorder": "total ascending"},
-                          margin=dict(l=200))
-        st.plotly_chart(fig, use_container_width=True)
+cols = st.columns(len(horizons))
+for i, (_, row) in enumerate(latest.iterrows()):
+    h = int(row["horizon"])
+    alerts, recs = apply_policy(
+        np.array([row["risk"]]), np.array([row["svol"]]), [row["type"]],
+        pcfg["risk_high"], pcfg["risk_medium"],
+        pcfg["svol_high"], pcfg["svol_medium"],
+        pcfg.get("boost_types"))
+    with cols[i]:
+        st.metric(f"{h}d Alert", format_alert(alerts[0]))
+        st.metric(f"{h}d Risk", f"{row['risk']:.1%}")
+        st.metric(f"{h}d SVol", f"{row['svol']:.1%}")
+        st.caption(f"Type: {row['type']}")
 
-    # Raw data
-    with st.expander("📋 Raw Predictions"):
-        st.dataframe(df.tail(30))
+mono = latest["risk"].values
+st.success(f"✅ Monotonic: {mono[0]:.1%} ≤ {mono[1]:.1%} ≤ {mono[2]:.1%}")
 
+# Charts
+st.divider()
+h_chart = st.selectbox("Chart horizon", horizons, index=0)
+chart_df = rdf[rdf["horizon"] == h_chart].set_index("date").tail(252)
+st.subheader(f"Risk & SVol ({h_chart}d)")
+st.line_chart(chart_df[["risk", "svol"]])
 
-if __name__ == "__main__":
-    main()
+st.divider()
+st.subheader("Recent (all horizons)")
+recent = rdf[rdf["date"] >= rdf["date"].max() - pd.Timedelta(days=30)].copy()
+recent["date"] = recent["date"].dt.strftime("%Y-%m-%d")
+recent["risk"] = recent["risk"].apply(lambda x: f"{x:.1%}")
+recent["svol"] = recent["svol"].apply(lambda x: f"{x:.1%}")
+st.dataframe(recent.sort_values(["date", "horizon"], ascending=[False, True]),
+             use_container_width=True, hide_index=True)
+
+st.divider()
+try:
+    st.subheader("Feature Importance")
+    imp = pd.read_csv(f"{art}/feature_importance.csv")
+    st.bar_chart(imp.head(20).set_index("feature")["importance"])
+except: pass
+
+try:
+    st.subheader("Metrics")
+    st.dataframe(pd.read_csv(f"{art}/metrics.csv"), use_container_width=True, hide_index=True)
+except: pass

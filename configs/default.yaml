@@ -1,104 +1,87 @@
-# configs/default.yaml
-# Social Volatility Forecaster
-
 data:
-  master_csv: "data/master.csv"
-  events_csv: "data/events.csv"
+  master_csv: data/master.csv
+  events_csv: data/events.csv
+  earliest_date: "2017-01-01"
 
 features:
-  # Your raw columns in master.csv
-  vix_cols:
-    - "vix"
-    - "vix_average_prev3d"
-    - "vix_average_prev7d"
-    - "vix_slope_20d"
-
-  # Rolling windows applied to vix + event_intensity
-  rolling_windows:
-    - 5
-    - 20
-    - 60
-
-  # Event history windows (days back to count events)
-  event_windows:
-    - 30
-    - 90
-
-  # Event types (3 merged classes)
-  event_types:
-    - "geopolitics"
-    - "macro"
-    - "crisis"
+  rolling_windows: [5, 20, 60]
+  event_windows: [30, 90]
+  target_count: 66
 
 labels:
-  horizons:
-    - 7
-    - 14
-    - 30
-  # Social vol = weighted combo of attention + market stress
+  min_severity: 4
+  horizons: [7, 14, 21]
   social_vol_weights:
-    attention: 0.70
-    market: 0.30
+    attention: 0.40
+    market_move: 0.35
+    iv_jump: 0.25
 
-model:
-  lgbm_params:
-    binary:
-      objective: "binary"
-      metric: "auc"
-      num_leaves: 31
-      learning_rate: 0.05
-      feature_fraction: 0.8
-      bagging_fraction: 0.8
-      bagging_freq: 5
-      verbose: -1
-      n_estimators: 500
-      early_stopping_rounds: 50
-      is_unbalance: true
-    multiclass:
-      objective: "multiclass"
-      metric: "multi_logloss"
-      num_leaves: 31
-      learning_rate: 0.05
-      feature_fraction: 0.8
-      bagging_fraction: 0.8
-      bagging_freq: 5
-      verbose: -1
-      n_estimators: 500
-      early_stopping_rounds: 50
-    regression:
-      objective: "regression"
-      metric: "rmse"
-      num_leaves: 31
-      learning_rate: 0.05
-      feature_fraction: 0.8
-      bagging_fraction: 0.8
-      bagging_freq: 5
-      verbose: -1
-      n_estimators: 500
-      early_stopping_rounds: 50
+event_type_mapping:
+  geopolitics: [geopolitics, political, government, war, election, sanctions,
+                "Politics & Government", "War, Geopolitics & Terrorism"]
+  macro: [macro, economic, finance, rates, inflation, "central bank", recession,
+          "Economy & Finance", "Crypto & Digital Assets"]
+  crisis: [tech, corporate, security, health, disaster, other, crisis,
+           "General / Breaking News", "Public Health & Disease",
+           "Natural Disasters & Climate", "Technology & AI"]
+
+severity:
+  intensity_weight: 0.5
+  iv_weight: 0.5
 
 validation:
-  val_years:
-    - 2022
-    - 2023
-    - 2024
-    - 2025
-  test_year: 2026
-  calibration_method: "isotonic"
+  val_years: [2020, 2021, 2022, 2023, 2024]
+  test_year: 2025
+
+model:
+  unified: true
+  monotonic_horizon: true
+  blend_weights:
+    ensemble: 0.60
+    single: 0.40
+  seeds: [42, 123, 777]
+  lgbm_params:
+    binary:
+      objective: binary
+      metric: binary_logloss
+      n_estimators: 500
+      learning_rate: 0.05
+      max_depth: 6
+      num_leaves: 31
+      min_child_samples: 20
+      subsample: 0.8
+      colsample_bytree: 0.8
+      reg_alpha: 0.1
+      reg_lambda: 1.0
+      verbose: -1
+    multiclass:
+      objective: multiclass
+      metric: multi_logloss
+      n_estimators: 300
+      learning_rate: 0.05
+      max_depth: 5
+      num_leaves: 31
+      min_child_samples: 10
+      verbose: -1
+    regression:
+      objective: regression
+      metric: rmse
+      n_estimators: 400
+      learning_rate: 0.05
+      max_depth: 6
+      num_leaves: 31
+      min_child_samples: 15
+      verbose: -1
 
 policy:
-  risk_high_threshold: 0.7
-  risk_medium_threshold: 0.4
-  social_vol_high_threshold: 0.7
-  social_vol_medium_threshold: 0.4
-  high_priority_types:
-    - "geopolitics"
-    - "macro"
+  risk_high: 0.70
+  risk_medium: 0.40
+  svol_high: 0.70
+  svol_medium: 0.40
+  boost_types: [geopolitics, macro]
 
 output:
-  artifacts_dir: "artifacts"
-  outputs_dir: "outputs"
-  reports_dir: "reports"
+  artifacts_dir: artifacts
 
 logging:
-  level: "INFO"
+  level: INFO

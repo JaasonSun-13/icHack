@@ -1,213 +1,176 @@
 #!/usr/bin/env python3
-"""
-predict.py – Generate predictions.
+"""SVF v3 Prediction — Unified Model.
+
+One model, queried 3 times (horizon=7/14/21) for each date.
+Post-hoc monotonicity enforced: risk_7d ≤ risk_14d ≤ risk_21d.
 
 Usage:
-    python predict.py --latest
-    python predict.py --model_dir artifacts/latest --latest
-    python predict.py --date 2025-06-15
+    python predict.py --spx 5800 --iv 28 --intensity 8.5 --spike 25
+    python predict.py --new_csv today.csv
+    python predict.py --last 10
+    python predict.py --date 2025-03-01
 """
+import argparse, glob, logging, os, sys
+import numpy as np, pandas as pd
 
-import argparse
-import json
-import os
-import sys
-
-import numpy as np
-import pandas as pd
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from src.utils import setup_logging, load_config, load_model
+from src.utils import setup_logging, load_config, load_pickle
 from src.data import load_master, load_events, compute_severity
-from src.features import build_all_features, get_feature_columns, EVENT_TYPES
-from src.models import predict_model, get_importance, EnsembleStack
-from src.calibration import CalibrationManager
-from src.policy import PolicyTree
+from src.features import build_all_features, get_feature_columns
+from src.models import blend_predictions, enforce_monotonic_post
+from src.policy import apply_policy, format_alert
+
+logger = logging.getLogger(__name__)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_dir", default="artifacts/latest")
-    parser.add_argument("--config", default="configs/default.yaml")
-    parser.add_argument("--latest", action="store_true")
-    parser.add_argument("--date", type=str, default=None)
-    parser.add_argument("--output", default="outputs/latest_prediction.csv")
+    parser.add_argument("--fold", type=int, default=-1, help="-1=production (last)")
+    parser.add_argument("--spx", type=float, default=None)
+    parser.add_argument("--iv", type=float, default=None)
+    parser.add_argument("--rv", type=float, default=None)
+    parser.add_argument("--rv3", type=float, default=None)
+    parser.add_argument("--intensity", type=float, default=None)
+    parser.add_argument("--spike", type=float, default=None)
+    parser.add_argument("--new_csv", default=None)
+    parser.add_argument("--date", default=None)
+    parser.add_argument("--last", type=int, default=1)
     args = parser.parse_args()
 
-    logger = setup_logging("INFO")
-    cfg = load_config(args.config)
+    cfg = load_config()
+    setup_logging("INFO")
 
-    # ── Load data & features ──────────────────────────────────────────────
     master = load_master(cfg["data"]["master_csv"])
     events = load_events(cfg["data"]["events_csv"])
     events = compute_severity(master, events)
 
-    feat_cfg = cfg["features"]
-    features_df = build_all_features(
-        master, events,
-        rolling_windows=feat_cfg["rolling_windows"],
-        event_windows=feat_cfg["event_windows"],
-    )
+    has_new = args.spx is not None or args.new_csv is not None
 
-    # ── Load model metadata ───────────────────────────────────────────────
-    fc_path = os.path.join(args.model_dir, "feature_columns.json")
-    if not os.path.exists(fc_path):
-        logger.error(f"No models found at {args.model_dir}")
-        logger.error("Run train.py first, then use --model_dir to point to the artifacts folder.")
-        logger.error("Check:  ls artifacts/")
-        return 1
+    if args.new_csv:
+        new = pd.read_csv(args.new_csv)
+        new.columns = new.columns.str.strip().str.lower()
+        new["date"] = pd.to_datetime(new["date"])
+        master = pd.concat([master, new], ignore_index=True).sort_values("date").reset_index(drop=True)
+    elif args.spx is not None:
+        last_date = master["date"].max()
+        new_date = last_date + pd.tseries.offsets.BDay(1)
+        new_row = pd.DataFrame([{
+            "date": new_date,
+            "spx_close": args.spx,
+            "1_day_vol": args.rv or master["1_day_vol"].iloc[-1],
+            "3_day_avg_vol": args.rv3 or master["3_day_avg_vol"].iloc[-1],
+            "30_day_implied_vol": args.iv or master["30_day_implied_vol"].iloc[-1],
+            "event_intensity": args.intensity or 0,
+            "trend_spike": args.spike or 0,
+        }])
+        master = pd.concat([master, new_row], ignore_index=True)
+        logger.info(f"Added: {new_date.strftime('%Y-%m-%d')} SPX={args.spx} IV={args.iv}")
 
-    with open(fc_path) as f:
-        feature_cols = json.load(f)
+    feat = build_all_features(master, events, cfg=cfg)
+    art = cfg["output"]["artifacts_dir"]
 
-    tm_path = os.path.join(args.model_dir, "event_type_mapping.json")
-    with open(tm_path) as f:
-        mapping = json.load(f)
-    idx_to_type = {int(k): v for k, v in mapping["idx_to_type"].items()}
+    feature_cols = load_pickle(f"{art}/feature_cols.pkl")  # 67 cols (66 + horizon)
+    horizons = load_pickle(f"{art}/horizons.pkl")
+    base_cols = [c for c in feature_cols if c != "horizon"]
 
-    import joblib
-    cal_path = os.path.join(args.model_dir, "calibrators.joblib")
-    cal_manager = joblib.load(cal_path) if os.path.exists(cal_path) else CalibrationManager()
+    # Find fold
+    matches = sorted(glob.glob(f"{art}/fold*_single.pkl"))
+    if not matches:
+        logger.error("No models found."); sys.exit(1)
+    folds = sorted(set(int(os.path.basename(m).split("fold")[1].split("_")[0]) for m in matches))
+    fi = folds[-1] if args.fold == -1 else args.fold
 
-    # ── Select rows ───────────────────────────────────────────────────────
-    if args.latest:
-        features_df = features_df.tail(1)
-    elif args.date:
-        features_df = features_df[features_df["date"] == pd.Timestamp(args.date)]
+    prefix = f"{art}/fold{fi}"
+    single = load_pickle(f"{prefix}_single.pkl")
+    ens = load_pickle(f"{prefix}_ensemble.pkl")
+    cal = load_pickle(f"{prefix}_calibrator.pkl")
+    type_model = load_pickle(f"{prefix}_type.pkl")
+    svol_model = load_pickle(f"{prefix}_svol.pkl")
 
-    if features_df.empty:
-        logger.error("No data for requested date")
-        return 1
+    blend_cfg = cfg.get("model", {}).get("blend_weights", {})
+    ens_w = blend_cfg.get("ensemble", 0.60)
+    sin_w = blend_cfg.get("single", 0.40)
 
-    for col in feature_cols:
-        if col not in features_df.columns:
-            features_df[col] = 0
-    X = features_df[feature_cols].values.astype(float)
-    dates = features_df["date"].values
+    # Select dates to predict
+    if args.date:
+        target = pd.Timestamp(args.date)
+        idx = (feat["date"] - target).abs().idxmin()
+        date_indices = [idx]
+    elif has_new:
+        date_indices = [len(feat) - 1]
+    else:
+        date_indices = list(range(max(0, len(feat) - args.last), len(feat)))
 
-    # ── Predict ───────────────────────────────────────────────────────────
-    horizons = cfg["labels"]["horizons"]
-    results = pd.DataFrame({"date": dates})
+    type_map = {0: "crisis", 1: "geopolitics", 2: "macro"}
+    pcfg = cfg["policy"]
 
-    for k in horizons:
+    for di in date_indices:
+        row_base = feat.iloc[di:di+1][base_cols].values  # (1, 66)
+        date = feat.iloc[di]["date"]
+
+        risk_probs = {}
+        svols = {}
+        etypes = {}
+
+        # Query model once per horizon
+        rows_stacked = []
+        for h in horizons:
+            row = np.hstack([row_base[0], [h]])  # append horizon
+            rows_stacked.append(row)
+        X = np.array(rows_stacked)  # (3, 67)
+
         # Risk
-        rk = f"risk_{k}d"
-        ens_path = os.path.join(args.model_dir, f"{rk}_ensemble_model.joblib")
-        rpath = os.path.join(args.model_dir, f"{rk}_model.joblib")
+        risk_raw = blend_predictions(ens.predict(X), single.predict(X), ens_w, sin_w)
+        risk_cal = cal.transform(risk_raw)
 
-        if os.path.exists(ens_path) and os.path.exists(rpath):
-            ens = load_model(ens_path)["model"]
-            rm = load_model(rpath)["model"]
-            prob = 0.6 * ens.predict(X) + 0.4 * predict_model(rm, X, "binary")
-            prob = cal_manager.transform(rk, prob)
-            results[f"{rk}_prob"] = prob
-            results[rk] = (prob >= 0.5).astype(int)
-        elif os.path.exists(rpath):
-            rm = load_model(rpath)["model"]
-            prob = predict_model(rm, X, "binary")
-            prob = cal_manager.transform(rk, prob)
-            results[f"{rk}_prob"] = prob
-            results[rk] = (prob >= 0.5).astype(int)
-
-        # Event type
-        tpath = os.path.join(args.model_dir, f"event_type_{k}d_model.joblib")
-        if os.path.exists(tpath):
-            tm = load_model(tpath)["model"]
-            tprob = predict_model(tm, X, "multiclass")
-            results[f"event_type_{k}d"] = np.argmax(tprob, axis=1)
-            results[f"event_type_{k}d_name"] = results[f"event_type_{k}d"].map(idx_to_type)
+        # Enforce monotonicity: risk_7d <= risk_14d <= risk_21d
+        for j in range(1, len(horizons)):
+            if risk_cal[j] < risk_cal[j-1]:
+                risk_cal[j] = risk_cal[j-1]
 
         # Social vol
-        vpath = os.path.join(args.model_dir, f"social_vol_{k}d_model.joblib")
-        if os.path.exists(vpath):
-            vm = load_model(vpath)["model"]
-            results[f"social_vol_{k}d"] = np.clip(predict_model(vm, X, "regression"), 0, 1)
+        if svol_model.model:
+            sv = svol_model.predict(X)
+            for j in range(1, len(horizons)):
+                if sv[j] < sv[j-1]:
+                    sv[j] = sv[j-1]
+        else:
+            sv = np.full(len(horizons), 0.5)
 
-    # Monotonicity: longer horizon >= shorter
-    sorted_h = sorted(horizons)
-    for i in range(1, len(sorted_h)):
-        cur = f"risk_{sorted_h[i]}d_prob"
-        prev = f"risk_{sorted_h[i-1]}d_prob"
-        if cur in results.columns and prev in results.columns:
-            results[cur] = np.maximum(results[cur].values, results[prev].values)
+        # Event type
+        if type_model.model:
+            tp = type_model.predict(X)
+            if tp.ndim > 1:
+                et = [type_map[np.argmax(tp[j])] for j in range(len(horizons))]
+            else:
+                et = [type_map[int(tp[j])] for j in range(len(horizons))]
+        else:
+            et = ["crisis"] * len(horizons)
 
-    # Save
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
-    results.to_csv(args.output, index=False)
+        # Apply policy per horizon
+        print(f"\n{'='*65}")
+        print(f"  SVF v3 — {pd.Timestamp(date).strftime('%Y-%m-%d')}")
+        print(f"{'='*65}")
+        print(f"  {'Horizon':>8s}  {'Alert':15s}  {'Risk':>8s}  {'SVol':>8s}  Type")
+        print(f"  {'─'*8}  {'─'*15}  {'─'*8}  {'─'*8}  {'─'*12}")
 
-    # ── Pretty print ──────────────────────────────────────────────────────
-    if args.latest or args.date:
-        row = results.iloc[0]
-        k = horizons[0]
+        for j, h in enumerate(horizons):
+            alerts, recs = apply_policy(
+                np.array([risk_cal[j]]), np.array([sv[j]]), [et[j]],
+                pcfg["risk_high"], pcfg["risk_medium"],
+                pcfg["svol_high"], pcfg["svol_medium"],
+                pcfg.get("boost_types", ["geopolitics", "macro"]))
+            print(f"  {h:>5d}d    {format_alert(alerts[0]):15s}  {risk_cal[j]:7.1%}  {sv[j]:7.1%}  {et[j]}")
 
-        risk_prob = row.get(f"risk_{k}d_prob", 0)
-        social_vol = row.get(f"social_vol_{k}d", 0)
-        etype = row.get(f"event_type_{k}d_name", "unknown")
-
-        # Top drivers
-        rpath = os.path.join(args.model_dir, f"risk_{k}d_model.joblib")
-        drivers = []
-        if os.path.exists(rpath):
-            rm = load_model(rpath)["model"]
-            imp = get_importance(rm, feature_cols)
-            drivers = [{"feature": f, "importance": v}
-                       for f, v in sorted(imp.items(), key=lambda x: -x[1])[:5]]
-
-        pol_cfg = cfg.get("policy", {})
-        pt = PolicyTree(
-            risk_high=pol_cfg.get("risk_high_threshold", 0.7),
-            risk_med=pol_cfg.get("risk_medium_threshold", 0.4),
-        )
-        decision = pt.evaluate(risk_prob, social_vol, etype, drivers)
-
-        icons = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}
-        icon = icons.get(decision.alert_level, "⚪")
-
-        print(f"\n{'═' * 60}")
-        print(f"  SOCIAL VOLATILITY FORECAST")
-        print(f"  Date: {row['date']}")
-        print(f"{'═' * 60}")
-
-        print(f"\n  📊 EVENT PROBABILITY")
-        print(f"  ┌─────────────────────────────────────┐")
-        for h in horizons:
-            p = row.get(f"risk_{h}d_prob", 0)
-            bar = "█" * int(p * 20) + "░" * (20 - int(p * 20))
-            print(f"  │  Next {h:2d}d: {p:5.1%}  {bar} │")
-        print(f"  └─────────────────────────────────────┘")
-
-        print(f"\n  📈 SOCIAL VOLATILITY")
-        print(f"  ┌─────────────────────────────────────┐")
-        for h in horizons:
-            v = row.get(f"social_vol_{h}d", 0)
-            bar = "█" * int(v * 20) + "░" * (20 - int(v * 20))
-            level = "HIGH" if v > 0.7 else "MED" if v > 0.4 else "LOW"
-            print(f"  │  Next {h:2d}d: {v:.2f}  {bar} {level:4s} │")
-        print(f"  └─────────────────────────────────────┘")
-
-        print(f"\n  🏷️  EVENT TYPE")
-        print(f"  ┌─────────────────────────────────────┐")
-        for h in horizons:
-            t = row.get(f"event_type_{h}d_name", "none")
-            print(f"  │  Next {h:2d}d: {str(t):30s}   │")
-        print(f"  └─────────────────────────────────────┘")
-
-        print(f"\n  {icon}  ALERT: {decision.alert_level}")
-
-        if decision.drivers:
-            print(f"\n  🔍 TOP DRIVERS:")
-            for d in decision.drivers:
-                print(f"     • {d}")
-
-        print(f"\n  💡 RECOMMENDATIONS:")
-        for persona, rec in decision.recommendations.items():
-            print(f"     [{persona.upper()}] {rec}")
-        print(f"{'═' * 60}\n")
-
-    logger.info(f"Saved: {args.output}")
-    return 0
+        # Show the longest horizon recommendation
+        alerts_21, recs_21 = apply_policy(
+            np.array([risk_cal[-1]]), np.array([sv[-1]]), [et[-1]],
+            pcfg["risk_high"], pcfg["risk_medium"],
+            pcfg["svol_high"], pcfg["svol_medium"],
+            pcfg.get("boost_types"))
+        print(f"\n  📋 {recs_21[0]}")
+        print(f"  ✅ Monotonic: {risk_cal[0]:.1%} ≤ {risk_cal[1]:.1%} ≤ {risk_cal[2]:.1%}")
+        print(f"{'='*65}\n")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

@@ -35,6 +35,9 @@ python evaluate.py --by_fold
 
 # 6. Dashboard
 streamlit run app.py
+
+# 7. Predict a next day
+python predict.py --spx 5200 --iv 35 --intensity 10 --spike 30
 ```
 
 ---
@@ -50,8 +53,10 @@ streamlit run app.py
 | vix_average_prev3d | You compute | Mean VIX over prior 3 trading days |
 | vix_average_prev7d | You compute | Mean VIX over prior 7 trading days |
 | vix_slope_20d | You compute | Linear regression slope of VIX over 20 days |
-| event_intensity | GDELT | Daily sum of news article counts for tracked keywords |
-| trend_spike | Google Trends | 0–100 weekly score (assigned to Friday, forward-filled) |
+| event_intensity = average daily proportion (e.g. 3.9% of all news)
+| trend_spike = proportion × duration (e.g. 3.9% × 30 days = 117) 
+
+
 
 ```csv
 date,vix,vix_average_prev3d,vix_average_prev7d,vix_slope_20d,event_intensity,trend_spike
@@ -190,3 +195,4 @@ Final:   Train [2015–2025]  →  Production model
     ├── master.csv           # Your daily data (7 columns)
     └── events.csv           # Your events (4 columns)
 ```
+

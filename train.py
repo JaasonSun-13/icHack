@@ -1,31 +1,30 @@
 #!/usr/bin/env python3
-"""
-train.py – Training pipeline.
+"""SVF v3 Training Pipeline — Unified Model.
+
+ONE model trained on all horizons (7/14/21) stacked together.
+LightGBM monotone_constraints on `horizon` feature enforces:
+  risk_7d ≤ risk_14d ≤ risk_21d (longer window = more chance of event)
+
+Post-hoc clipping guarantees monotonicity after calibration.
 
 Usage:
     python train.py
     python train.py --config configs/default.yaml
 """
+import argparse, logging, os, sys
+import numpy as np, pandas as pd
 
-import argparse
-import copy
-import json
-import os
-import sys
-
-import numpy as np
-import pandas as pd
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from src.utils import setup_logging, load_config, save_model, save_json, get_timestamp
+from src.utils import setup_logging, load_config, save_pickle
 from src.data import load_master, load_events, validate, compute_severity
-from src.features import build_all_features, get_feature_columns, EVENT_TYPES
-from src.labels import create_all_labels
-from src.splits import get_walk_forward_splits
-from src.models import train_model, predict_model, get_importance, EnsembleStack
-from src.calibration import CalibrationManager
+from src.features import build_all_features, get_feature_columns
+from src.labels import create_all_labels, stack_unified
+from src.splits import walk_forward_splits
+from src.models import (LGBModel, EnsembleStack, blend_predictions,
+                        build_monotone_constraints, enforce_monotonic_post)
+from src.calibration import IsotonicCalibrator
 from src.metrics import binary_metrics, multiclass_metrics, regression_metrics
+
+logger = logging.getLogger(__name__)
 
 
 def main():
@@ -34,237 +33,220 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    logger = setup_logging(cfg.get("logging", {}).get("level", "INFO"))
-    logger.info("=" * 70)
-    logger.info("Social Volatility Forecaster – Training")
-    logger.info("=" * 70)
+    setup_logging(cfg.get("logging", {}).get("level", "INFO"))
+    logger.info("=" * 60)
+    logger.info("SVF v3 — Unified Model Training")
+    logger.info("=" * 60)
 
-    # ── 1. Load data ──────────────────────────────────────────────────────
+    # ── 1. Load & validate ────────────────────────────────────────────
     master = load_master(cfg["data"]["master_csv"])
     events = load_events(cfg["data"]["events_csv"])
     ok, issues = validate(master, events)
     if not ok:
-        return 1
-    events = compute_severity(master, events)
+        logger.error(f"Validation failed: {issues}")
+        sys.exit(1)
 
-    # ── 2. Build features ─────────────────────────────────────────────────
-    feat_cfg = cfg["features"]
-    features_df = build_all_features(
-        master, events,
-        rolling_windows=feat_cfg["rolling_windows"],
-        event_windows=feat_cfg["event_windows"],
-    )
-    feature_cols = get_feature_columns(features_df)
-    logger.info(f"Features: {len(feature_cols)} columns")
+    # ── 2. Auto-severity ──────────────────────────────────────────────
+    sev_cfg = cfg.get("severity", {})
+    events = compute_severity(master, events,
+                              iw=sev_cfg.get("intensity_weight", 0.5),
+                              ivw=sev_cfg.get("iv_weight", 0.5))
 
-    # ── 3. Create labels ──────────────────────────────────────────────────
-    lab_cfg = cfg["labels"]
-    horizons = lab_cfg["horizons"]
-    labels_df = create_all_labels(
-        master, events,
-        horizons=horizons,
-        attention_weight=lab_cfg["social_vol_weights"]["attention"],
-        market_weight=lab_cfg["social_vol_weights"]["market"],
-    )
+    # ── 3. Features (66 exactly) ──────────────────────────────────────
+    feat = build_all_features(master, events, cfg=cfg)
+    base_feature_cols = get_feature_columns(feat)
+    assert len(base_feature_cols) == 66, f"Expected 66, got {len(base_feature_cols)}"
 
-    # ── 4. Merge ──────────────────────────────────────────────────────────
-    combined = features_df.merge(labels_df, on="date", how="inner")
-    logger.info(f"Combined: {combined.shape}")
+    # ── 4. Labels ─────────────────────────────────────────────────────
+    lab_cfg = cfg.get("labels", {})
+    horizons = lab_cfg.get("horizons", [7, 14, 21])
+    labels = create_all_labels(master, events, **lab_cfg)
 
-    # Event type encoding
-    type_to_idx = {t: i for i, t in enumerate(sorted(EVENT_TYPES))}
-    idx_to_type = {i: t for t, i in type_to_idx.items()}
-    n_classes = len(type_to_idx)
+    # ── 5. Stack into unified format ──────────────────────────────────
+    stacked = stack_unified(feat, labels, horizons=horizons)
+    unified_features = base_feature_cols + ["horizon"]  # 67 columns
+    logger.info(f"Unified features: {len(unified_features)} (66 base + horizon)")
 
-    for k in horizons:
-        combined[f"event_type_{k}d"] = combined[f"event_type_{k}d"].map(type_to_idx)
+    # ── 6. Monotone constraints ───────────────────────────────────────
+    mc = build_monotone_constraints(unified_features)
+    logger.info(f"Monotone constraints: ...{mc[-20:]}")
 
-    # ── 5. Walk-forward splits ────────────────────────────────────────────
-    val_cfg = cfg["validation"]
-    splits = get_walk_forward_splits(
-        combined["date"], val_cfg["val_years"], val_cfg["test_year"]
-    )
+    # ── 7. Walk-forward splits (on dates) ─────────────────────────────
+    val_cfg = cfg.get("validation", {})
+    date_splits = walk_forward_splits(
+        feat["date"], val_cfg["val_years"], val_cfg["test_year"])
 
-    # ── 6. Train ──────────────────────────────────────────────────────────
-    model_cfg = cfg["model"]["lgbm_params"]
-    cal_manager = CalibrationManager(val_cfg["calibration_method"])
-    all_predictions = []
-    all_metrics = {}
-    trained_models = {}
-
-    for split in splits:
-        fold = split["fold"]
-        vy = split["val_year"]
-        tr_idx = split["train_idx"]
-        va_idx = split["val_idx"]
-        fold_tag = f"fold_{fold}" if fold >= 0 else "final"
-
-        logger.info(f"\n{'='*60}")
-        logger.info(f"  {fold_tag.upper()} (val_year={vy}, train={len(tr_idx)}, val={len(va_idx)})")
-        logger.info(f"{'='*60}")
-
-        if len(va_idx) == 0 and fold >= 0:
-            logger.warning(f"  Skipping {fold_tag} — no validation data for {vy}")
-            continue
-
-        X_tr = combined.iloc[tr_idx][feature_cols].values.astype(float)
-        X_va = combined.iloc[va_idx][feature_cols].values.astype(float) if len(va_idx) > 0 else np.empty((0, len(feature_cols)))
-
-        fold_pred = combined.iloc[va_idx][["date"]].copy()
-        fold_pred["fold"] = fold
-        fold_pred["val_year"] = vy
-        fold_metrics = {}
-
-        for k in horizons:
-            logger.info(f"\n  ── Horizon {k}d ──")
-
-            # ── Risk (binary) ──
-            y_tr_r = combined.iloc[tr_idx][f"risk_{k}d"].values.astype(float)
-            y_va_r = combined.iloc[va_idx][f"risk_{k}d"].values.astype(float)
-
-            params = copy.deepcopy(model_cfg["binary"])
-            risk_model = train_model(X_tr, y_tr_r, X_va, y_va_r, params, "binary")
-            risk_prob_single = predict_model(risk_model, X_va, "binary")
-
-            logger.info(f"    Training ensemble ...")
-            ens = EnsembleStack("binary")
-            ens.train(X_tr, y_tr_r, X_va, y_va_r)
-            risk_prob_ens = ens.predict(X_va)
-
-            risk_prob = 0.6 * risk_prob_ens + 0.4 * risk_prob_single
-            risk_key = f"risk_{k}d"
-            trained_models[risk_key] = risk_model
-            trained_models[f"{risk_key}_ensemble"] = ens
-
-            if fold >= 0 and len(y_va_r) > 0:
-                cal_manager.fit(risk_key, risk_prob, y_va_r)
-            cal_prob = cal_manager.transform(risk_key, risk_prob) if len(risk_prob) > 0 else risk_prob
-
-            fold_pred[f"risk_{k}d_prob"] = cal_prob
-            fold_pred[f"risk_{k}d"] = (cal_prob >= 0.5).astype(int) if len(cal_prob) > 0 else []
-            fold_pred[f"actual_risk_{k}d"] = y_va_r
-
-            if len(y_va_r) > 0:
-                rm = binary_metrics(y_va_r, cal_prob)
-                fold_metrics[risk_key] = rm
-                logger.info(f"    Risk: AUROC={rm.get('auroc', 0):.3f}  Brier={rm['brier']:.3f}")
-            else:
-                logger.info(f"    Risk: No val data — skipping metrics")
-
-            # ── Event type (multiclass) ──
-            y_tr_t = combined.iloc[tr_idx][f"event_type_{k}d"].values.astype(float)
-            y_va_t = combined.iloc[va_idx][f"event_type_{k}d"].values.astype(float)
-            tr_mask_t = ~np.isnan(y_tr_t)
-            va_mask_t = ~np.isnan(y_va_t)
-
-            if tr_mask_t.sum() > 10 and va_mask_t.sum() > 5:
-                params = copy.deepcopy(model_cfg["multiclass"])
-                type_model = train_model(
-                    X_tr[tr_mask_t], y_tr_t[tr_mask_t],
-                    X_va[va_mask_t], y_va_t[va_mask_t],
-                    params, "multiclass", num_class=n_classes,
-                )
-                type_prob = predict_model(type_model, X_va, "multiclass")
-                type_pred = np.argmax(type_prob, axis=1)
-                type_key = f"event_type_{k}d"
-                trained_models[type_key] = type_model
-
-                fold_pred[f"event_type_{k}d"] = type_pred
-                fold_pred[f"actual_event_type_{k}d"] = y_va_t
-
-                tm = multiclass_metrics(y_va_t[va_mask_t], type_pred[va_mask_t], type_prob[va_mask_t])
-                fold_metrics[type_key] = tm
-                logger.info(f"    Type: macro_f1={tm['macro_f1']:.3f}  acc={tm['accuracy']:.3f}")
-            else:
-                logger.warning(f"    Type: Skipped (insufficient samples)")
-
-            # ── Social volatility (regression) ──
-            y_tr_v = combined.iloc[tr_idx][f"social_vol_{k}d"].values.astype(float)
-            y_va_v = combined.iloc[va_idx][f"social_vol_{k}d"].values.astype(float)
-            tr_mask_v = ~np.isnan(y_tr_v)
-            va_mask_v = ~np.isnan(y_va_v)
-
-            if tr_mask_v.sum() > 10 and va_mask_v.sum() > 5:
-                params = copy.deepcopy(model_cfg["regression"])
-                vol_model = train_model(
-                    X_tr[tr_mask_v], y_tr_v[tr_mask_v],
-                    X_va[va_mask_v], y_va_v[va_mask_v],
-                    params, "regression",
-                )
-                vol_pred = predict_model(vol_model, X_va, "regression")
-                vol_key = f"social_vol_{k}d"
-                trained_models[vol_key] = vol_model
-
-                fold_pred[f"social_vol_{k}d"] = np.clip(vol_pred, 0, 1)
-                fold_pred[f"actual_social_vol_{k}d"] = y_va_v
-
-                vm = regression_metrics(y_va_v[va_mask_v], vol_pred[va_mask_v])
-                fold_metrics[vol_key] = vm
-                logger.info(f"    SocVol: RMSE={vm['rmse']:.3f}  Spearman={vm.get('spearman', 0):.3f}")
-            else:
-                logger.warning(f"    SocVol: Skipped (insufficient samples)")
-
-        all_predictions.append(fold_pred)
-        all_metrics[fold_tag] = fold_metrics
-
-    # ── 7. Save ───────────────────────────────────────────────────────────
-    timestamp = get_timestamp()
-    art_dir = os.path.join(cfg["output"]["artifacts_dir"], timestamp)
+    art_dir = cfg["output"]["artifacts_dir"]
     os.makedirs(art_dir, exist_ok=True)
 
-    for key, model in trained_models.items():
-        save_model(model, {"key": key}, os.path.join(art_dir, f"{key}_model.joblib"))
+    blend_cfg = cfg.get("model", {}).get("blend_weights", {})
+    ens_w = blend_cfg.get("ensemble", 0.60)
+    sin_w = blend_cfg.get("single", 0.40)
+    seeds = cfg.get("model", {}).get("seeds", [42, 123, 777])
+    n_horizons = len(horizons)
 
-    import joblib
-    joblib.dump(cal_manager, os.path.join(art_dir, "calibrators.joblib"))
+    all_metrics = []
+    last_risk_cal = None  # track calibrator for production fold
 
-    save_json({"type_to_idx": type_to_idx, "idx_to_type": idx_to_type},
-              os.path.join(art_dir, "event_type_mapping.json"))
-    save_json(feature_cols, os.path.join(art_dir, "feature_columns.json"))
+    for fold_i, (tr_date_idx, va_date_idx, year) in enumerate(date_splits):
+        is_final = (fold_i == len(date_splits) - 1)
+        tag = "FINAL (production)" if is_final else f"Fold {fold_i}"
+        logger.info(f"\n{'='*50}")
+        logger.info(f"{tag}: train_dates={len(tr_date_idx)} val_dates={len(va_date_idx)} year={year}")
 
-    # Feature importance
-    best_risk = f"risk_{horizons[0]}d"
-    if best_risk in trained_models:
-        imp = get_importance(trained_models[best_risk], feature_cols)
-        imp_sorted = dict(sorted(imp.items(), key=lambda x: -x[1])[:30])
-        save_json(imp_sorted, os.path.join(art_dir, "feature_importance.json"))
+        # Map date indices → stacked indices (each date has n_horizons rows)
+        tr_dates = set(tr_date_idx)
+        va_dates = set(va_date_idx)
+        tr_mask = stacked["date"].isin(feat["date"].iloc[list(tr_dates)])
+        va_mask = stacked["date"].isin(feat["date"].iloc[list(va_dates)])
+        tr_idx = np.where(tr_mask)[0]
+        va_idx = np.where(va_mask)[0]
 
-    # Symlink
-    latest = os.path.join(cfg["output"]["artifacts_dir"], "latest")
-    if os.path.islink(latest):
-        os.remove(latest)
-    elif os.path.isdir(latest):
-        import shutil
-        shutil.rmtree(latest)
-    try:
-        os.symlink(os.path.abspath(art_dir), latest)
-    except OSError:
-        # Windows or permission issue: copy instead
-        import shutil
-        shutil.copytree(art_dir, latest)
+        logger.info(f"  Stacked: train={len(tr_idx)} val={len(va_idx)}")
 
-    # Predictions
-    pred_df = pd.concat(all_predictions, ignore_index=True)
-    out_dir = cfg["output"]["outputs_dir"]
-    os.makedirs(out_dir, exist_ok=True)
-    pred_path = os.path.join(out_dir, "predictions.csv")
-    pred_df.to_csv(pred_path, index=False)
-    logger.info(f"Predictions: {pred_path} ({len(pred_df)} rows)")
+        X_tr = stacked.iloc[tr_idx][unified_features].values
+        X_va = stacked.iloc[va_idx][unified_features].values
+        y_tr_r = stacked.iloc[tr_idx]["risk"].values
+        y_va_r = stacked.iloc[va_idx]["risk"].values
 
-    # Metrics
-    rep_dir = cfg["output"]["reports_dir"]
-    os.makedirs(rep_dir, exist_ok=True)
-    save_json(all_metrics, os.path.join(rep_dir, "metrics.json"))
+        # For final fold: 80/20 internal split for early stopping
+        if is_final:
+            n = len(tr_idx)
+            sp = int(n * 0.8)
+            X_tr_es, X_va_es = X_tr[:sp], X_tr[sp:]
+            y_tr_es, y_va_es = y_tr_r[:sp], y_tr_r[sp:]
+        else:
+            X_tr_es, X_va_es = X_tr, X_va
+            y_tr_es, y_va_es = y_tr_r, y_va_r
 
-    logger.info("\n" + "=" * 70)
-    logger.info("DONE")
-    logger.info(f"  Models:      {art_dir}")
-    logger.info(f"  Predictions: {pred_path}")
-    logger.info(f"  Evaluate:    python evaluate.py")
-    logger.info(f"  Predict:     python predict.py --model_dir {art_dir} --latest")
-    logger.info("=" * 70)
-    return 0
+        # ── Risk model (unified, with monotone constraint) ────────
+        bp = cfg["model"]["lgbm_params"]["binary"].copy()
+        bp["monotone_constraints"] = mc
+
+        single = LGBModel(bp.copy(), "binary")
+        single.train(X_tr_es, y_tr_es,
+                     X_va_es if len(X_va_es) > 0 else None,
+                     y_va_es if len(y_va_es) > 0 else None)
+
+        ens = EnsembleStack(bp.copy(), "binary", seeds=seeds)
+        ens.train(X_tr_es, y_tr_es,
+                  X_va_es if len(X_va_es) > 0 else None,
+                  y_va_es if len(y_va_es) > 0 else None)
+
+        # Calibration
+        if is_final:
+            cal = last_risk_cal if last_risk_cal else IsotonicCalibrator()
+            logger.info(f"  Reusing calibrator (fitted={cal.fitted})")
+        else:
+            cal = IsotonicCalibrator()
+            if len(y_va_r) > 0:
+                raw = blend_predictions(ens.predict(X_va), single.predict(X_va), ens_w, sin_w)
+                cal.fit(raw, y_va_r)
+            last_risk_cal = cal
+
+        # ── Event type model (multiclass) ─────────────────────────
+        type_map = {"crisis": 0, "geopolitics": 1, "macro": 2}
+        tr_risk_mask = stacked.iloc[tr_idx]["risk"] == 1
+        X_tr_t = stacked.iloc[tr_idx].loc[tr_risk_mask, unified_features].values
+        y_tr_t = stacked.iloc[tr_idx].loc[tr_risk_mask, "event_type"].map(type_map).values
+
+        mp = cfg["model"]["lgbm_params"]["multiclass"].copy()
+        mp["num_class"] = 3
+        type_model = LGBModel(mp, "multiclass")
+        if len(X_tr_t) > 10:
+            type_model.train(X_tr_t, y_tr_t)
+
+        # ── Social vol model (regression) ─────────────────────────
+        svol_mask = ~stacked.iloc[tr_idx]["social_vol"].isna()
+        X_tr_s = stacked.iloc[tr_idx].loc[svol_mask, unified_features].values
+        y_tr_s = stacked.iloc[tr_idx].loc[svol_mask, "social_vol"].values
+
+        # Social vol also monotone on horizon
+        rp = cfg["model"]["lgbm_params"]["regression"].copy()
+        rp["monotone_constraints"] = mc
+
+        svol_model = LGBModel(rp.copy(), "regression")
+        if len(X_tr_s) > 10:
+            svol_va_mask = ~stacked.iloc[va_idx]["social_vol"].isna()
+            X_va_s = stacked.iloc[va_idx].loc[svol_va_mask, unified_features].values if svol_va_mask.any() else None
+            y_va_s = stacked.iloc[va_idx].loc[svol_va_mask, "social_vol"].values if svol_va_mask.any() else None
+            svol_model.train(X_tr_s, y_tr_s, X_va_s, y_va_s)
+
+        # ── Save ──────────────────────────────────────────────────
+        prefix = f"{art_dir}/fold{fold_i}"
+        save_pickle(single, f"{prefix}_single.pkl")
+        save_pickle(ens, f"{prefix}_ensemble.pkl")
+        save_pickle(cal, f"{prefix}_calibrator.pkl")
+        save_pickle(type_model, f"{prefix}_type.pkl")
+        save_pickle(svol_model, f"{prefix}_svol.pkl")
+
+        # ── Per-horizon metrics on validation ─────────────────────
+        if len(y_va_r) > 0:
+            risk_raw = blend_predictions(ens.predict(X_va), single.predict(X_va), ens_w, sin_w)
+            risk_cal = cal.transform(risk_raw)
+            risk_cal = enforce_monotonic_post(risk_cal, horizons, len(va_date_idx))
+
+            for hi, h in enumerate(horizons):
+                h_mask = stacked.iloc[va_idx]["horizon"].values == h
+                if not h_mask.any():
+                    continue
+                rm = binary_metrics(y_va_r[h_mask], risk_cal[h_mask])
+
+                # Type metrics
+                tm = {"accuracy": 0, "macro_f1": 0}
+                va_risk_h = (stacked.iloc[va_idx]["risk"].values == 1) & h_mask
+                if type_model.model and va_risk_h.any():
+                    tp = type_model.predict(X_va[va_risk_h])
+                    yt = stacked.iloc[va_idx].loc[va_risk_h, "event_type"].map(type_map).values
+                    tm = multiclass_metrics(yt, tp)
+
+                # Svol metrics
+                sm = {"rmse": 999, "spearman": 0}
+                va_svol_h = (~stacked.iloc[va_idx]["social_vol"].isna().values) & h_mask
+                if svol_model.model and va_svol_h.any():
+                    sp = svol_model.predict(X_va[va_svol_h])
+                    ys = stacked.iloc[va_idx]["social_vol"].values[va_svol_h]
+                    sm = regression_metrics(ys, sp)
+
+                fold_m = {"fold": fold_i, "year": year, "horizon": h,
+                          **{f"risk_{k}": v for k, v in rm.items()},
+                          **{f"type_{k}": v for k, v in tm.items()},
+                          **{f"svol_{k}": v for k, v in sm.items()}}
+                all_metrics.append(fold_m)
+                logger.info(f"  {h}d: AUROC={rm['auroc']:.3f} F1={rm['f1']:.3f} "
+                            f"Brier={rm['brier']:.3f} | TypeF1={tm['macro_f1']:.3f} | "
+                            f"Svol RMSE={sm['rmse']:.3f}")
+
+    # ── Save artifacts ────────────────────────────────────────────────
+    save_pickle(unified_features, f"{art_dir}/feature_cols.pkl")
+    save_pickle(horizons, f"{art_dir}/horizons.pkl")
+
+    # Feature importance from last single model
+    imp = single.importance()
+    if len(imp) == len(unified_features):
+        imp_df = pd.DataFrame({"feature": unified_features, "importance": imp})
+        imp_df = imp_df.sort_values("importance", ascending=False)
+        imp_df.to_csv(f"{art_dir}/feature_importance.csv", index=False)
+
+    if all_metrics:
+        mdf = pd.DataFrame(all_metrics)
+        mdf.to_csv(f"{art_dir}/metrics.csv", index=False)
+        logger.info(f"\n{'='*60}")
+        logger.info("Validation Metrics:")
+        logger.info(f"\n{mdf.to_string(index=False)}")
+
+        # Show monotonicity check
+        logger.info(f"\n{'='*60}")
+        logger.info("Monotonicity check (mean risk AUROC by horizon):")
+        for h in horizons:
+            sub = mdf[mdf["horizon"] == h]
+            if len(sub) > 0:
+                logger.info(f"  {h}d: mean AUROC={sub['risk_auroc'].mean():.3f}")
+
+    logger.info(f"\n✅ Done! Unified model saved to {art_dir}/")
+    logger.info(f"   1 risk model serves all horizons (7/14/21)")
+    logger.info(f"   Monotone constraint: risk_7d ≤ risk_14d ≤ risk_21d ✓")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

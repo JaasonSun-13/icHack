@@ -1,56 +1,32 @@
-# src/splits.py
-"""Walk-forward expanding-window validation splits."""
-
+"""Walk-forward expanding-window splits. No shuffling, no future leakage."""
 import logging
-from typing import Dict, List, Tuple
-
 import numpy as np
-import pandas as pd
 
 logger = logging.getLogger(__name__)
 
 
-def get_walk_forward_splits(
-    dates: pd.Series,
-    val_years: List[int],
-    test_year: int,
-) -> List[Dict]:
-    """Generate walk-forward validation splits.
+def walk_forward_splits(dates, val_years, test_year):
+    """Yield (train_idx, val_idx, year) for each fold.
 
-    Expanding window: train on all years before val_year, validate on val_year.
-
-    Returns list of dicts:
-      { "fold": int, "val_year": int,
-        "train_idx": np.array, "val_idx": np.array }
+    Folds per spec:
+      Fold 0: Train 2017-2019 → Validate 2020
+      Fold 1: Train 2017-2020 → Validate 2021
+      ...
+      Final:  Train 2017-2024 → Test 2025
     """
     years = dates.dt.year
     splits = []
 
-    for fold, vy in enumerate(val_years):
-        train_mask = years < vy
-        val_mask = years == vy
-        if train_mask.sum() == 0 or val_mask.sum() == 0:
-            logger.warning(f"Skipping fold {fold} (val_year={vy}): insufficient data")
-            continue
-        splits.append({
-            "fold": fold,
-            "val_year": vy,
-            "train_idx": np.where(train_mask)[0],
-            "val_idx": np.where(val_mask)[0],
-        })
-        logger.info(f"  Fold {fold}: train {train_mask.sum()} rows "
-                     f"(< {vy}), val {val_mask.sum()} rows ({vy})")
+    for vy in val_years:
+        tr = np.where(years < vy)[0]
+        va = np.where(years == vy)[0]
+        splits.append((tr, va, vy))
+        logger.info(f"Fold {len(splits)-1}: train<{vy} ({len(tr)}) → val {vy} ({len(va)})")
 
-    # Final model: train on everything before test_year
-    final_train = years < test_year
-    final_test = years == test_year
-    splits.append({
-        "fold": -1,
-        "val_year": test_year,
-        "train_idx": np.where(final_train)[0],
-        "val_idx": np.where(final_test)[0],
-    })
-    logger.info(f"  Final: train {final_train.sum()} rows, "
-                f"test {final_test.sum()} rows ({test_year})")
+    # Final: train on everything < test_year, validate on test_year
+    tr = np.where(years < test_year)[0]
+    va = np.where(years == test_year)[0]
+    splits.append((tr, va, test_year))
+    logger.info(f"Final: train<{test_year} ({len(tr)}) → test {test_year} ({len(va)})")
 
     return splits
