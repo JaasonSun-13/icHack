@@ -49,10 +49,10 @@ python predict.py --spx 5200 --iv 35 --intensity 10 --spike 30
 | Column | Source | Description |
 |--------|--------|-------------|
 | date | — | Trading date (YYYY-MM-DD) |
-| vix | CBOE | VIX closing value |
-| vix_average_prev3d | You compute | Mean VIX over prior 3 trading days |
-| vix_average_prev7d | You compute | Mean VIX over prior 7 trading days |
-| vix_slope_20d | You compute | Linear regression slope of VIX over 20 days |
+| 1_day_vol | CBOE | VIX closing value |
+| 3_day_avg_vol | You compute | Mean VIX over prior 3 trading days |
+| 30_day_implied_vol | You compute | Mean VIX over prior 7 trading days |
+| spx_close | You compute | Linear regression slope of VIX over 20 days |
 | event_intensity = average daily proportion (e.g. 3.9% of all news)
 | trend_spike = proportion × duration (e.g. 3.9% × 30 days = 117) 
 
