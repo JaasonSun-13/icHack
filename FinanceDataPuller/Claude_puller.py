@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-import yfinance as yf
+# import yfinance as yf
 import time
 from pytrends.request import TrendReq
 # import anthropic
@@ -24,9 +24,7 @@ years = np.arange(2023, 2026)
 for i in years:
     i = int(i)
 
-    df_trend = pd.read_csv(
-        f'FinanceDataPuller/TrendCsv/searched_with_rising-queries_US_{i}0101-0000_20260131-17.csv'
-    )
+    df_trend = pd.read_csv(f'/Users/jayhung/Desktop/icHack/FinanceDataPuller/TrendCsv/searched_with_rising-queries_US_{i}0101-0000_20260131-17.csv')
 
     keywords = df_trend['query'].dropna().tolist()
 
@@ -47,10 +45,9 @@ for i in years:
 
         if not df.empty:
             all_data.append(df)
-        
 
-        time.sleep(5)  # avoid 429 / 400
+    time.sleep(5)  # avoid 429 / 400
 
     if all_data:
         final_df = pd.concat(all_data, axis=1)
-        final_df.to_csv(f'FinanceDataPuller/pytrendsCSV/pytrends_{i}.csv')
+        final_df.to_csv(f'/Users/jayhung/Desktop/icHack/FinanceDataPuller/pytrendsCSV/pytrends_{i}.csv')
