@@ -1,4 +1,4 @@
-# Social Volatility Forecaster v3
+# Social Volatility Forecaster
 
 An early warning system that predicts social/market disruption using VIX, GDELT news intensity, Google Trends, and historical events.
 
